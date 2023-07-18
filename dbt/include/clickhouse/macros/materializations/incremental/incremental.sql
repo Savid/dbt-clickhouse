@@ -1,7 +1,12 @@
 {% materialization incremental, adapter='clickhouse' %}
+  {%- set local_suffix = adapter.get_clickhouse_local_suffix() -%}
+  {%- set local_model = this -%}
+  {% if config.get('distributed') %}
+    {%- set local_model = local_model.incorporate(path={"identifier": model['name'] + local_suffix}) -%}
+  {% endif %}
 
-  {%- set existing_relation = load_cached_relation(this) -%}
-  {%- set target_relation = this.incorporate(type='table') -%}
+  {%- set existing_relation = load_cached_relation(local_model) -%}
+  {%- set target_relation = local_model.incorporate(type='table') -%}
 
   {%- set unique_key = config.get('unique_key') -%}
   {% if unique_key is not none and unique_key|length == 0 %}
@@ -88,6 +93,10 @@
       {% do to_drop.append(backup_relation) %}
   {% endif %}
 
+  {% if config.get('distributed') %}
+    {% do clickhouse__incremental_create_distributed(target_relation) %}
+  {% endif %}
+
   {% set should_revoke = should_revoke(existing_relation, full_refresh_mode) %}
   {% do apply_grants(target_relation, grant_config, should_revoke=should_revoke) %}
 
@@ -111,7 +120,31 @@
 
 {%- endmaterialization %}
 
-{% macro clickhouse__incremental_legacy(existing_relation, intermediate_relation, column_changes, unique_key, is_distributed=False) %}
+{% macro process_schema_changes(on_schema_change, source_relation, target_relation) %}
+
+    {%- set schema_changes_dict = check_for_schema_changes(source_relation, target_relation) -%}
+    {% if not schema_changes_dict['schema_changed'] %}
+      {{ return }}
+    {% endif %}
+
+    {% if on_schema_change == 'fail' %}
+      {% set fail_msg %}
+          The source and target schemas on this incremental model are out of sync!
+          They can be reconciled in several ways:
+            - set the `on_schema_change` config to either append_new_columns or sync_all_columns, depending on your situation.
+            - Re-run the incremental model with `full_refresh: True` to update the target schema.
+            - update the schema manually and re-run the process.
+      {% endset %}
+      {% do exceptions.raise_compiler_error(fail_msg) %}
+      {{ return }}
+    {% endif %}
+
+    {% do sync_column_schemas(on_schema_change, target_relation, schema_changes_dict) %}
+
+{% endmacro %}
+
+{% macro clickhouse__incremental_legacy(existing_relation, intermediate_relation, on_schema_change, unique_key, is_distributed=False) %}
+    -- First create a temporary table for all of the new data
     {% set new_data_relation = existing_relation.incorporate(path={"identifier": existing_relation.identifier + '__dbt_new_data'}) %}
     {{ drop_relation_if_exists(new_data_relation) }}
 
@@ -192,7 +225,6 @@
 
 {% endmacro %}
 
-
 {% macro clickhouse__incremental_delete_insert(existing_relation, unique_key, incremental_predicates, is_distributed=False) %}
     {% set new_data_relation = existing_relation.incorporate(path={"identifier": existing_relation.identifier
        + '__dbt_new_data_' + invocation_id.replace('-', '_')}) %}
@@ -235,4 +267,37 @@
     {% endcall %}
     {% do adapter.drop_relation(new_data_relation) %}
     {{ drop_relation_if_exists(distributed_new_data_relation) }}
+{% endmacro %}
+
+{% macro clickhouse__incremental_create_distributed(relation) %}
+    {%- set cluster = adapter.get_clickhouse_cluster_name()[1:-1] -%}
+    {%- set sharding = config.get('sharding_key') -%}
+    {%- set existing_relation = load_cached_relation(this) -%}
+    
+    {% if existing_relation is none %}
+      {% call statement('create_distributed_table') %}
+        CREATE TABLE {{ model['name'] }} {{ on_cluster_clause() }} AS {{ relation }}
+        ENGINE = Distributed('{{ cluster}}', '{{ relation.schema }}', '{{ relation.name }}'
+        {% if sharding is not none %}
+            , {{ sharding }}
+        {% endif %}
+        )
+      {% endcall %}
+    {% else %}
+      {% call statement('create_temp_distributed_table') %}
+        CREATE TABLE {{ model['name'] }}_dbt_temp {{ on_cluster_clause() }} AS {{ relation }}
+        ENGINE = Distributed('{{ cluster}}', '{{ relation.schema }}', '{{ relation.name }}'
+        {% if sharding is not none %}
+            , {{ sharding }}
+        {% endif %}
+        )
+      {% endcall %}
+      {% call statement('exchange_distributed_table') %}
+        EXCHANGE TABLES {{ model['name'] }}_dbt_temp AND {{ model['name'] }} {{ on_cluster_clause() }}
+      {% endcall %}
+      {% call statement('drop_temp_distributed_table') %}
+        DROP TABLE {{ model['name'] }}_dbt_temp {{ on_cluster_clause() }}
+      {% endcall %}
+    {% endif %}
+
 {% endmacro %}
