@@ -1,7 +1,12 @@
 {% materialization incremental, adapter='clickhouse' %}
+  {%- set local_suffix = adapter.get_clickhouse_local_suffix() -%}
+  {%- set local_model = this -%}
+  {% if config.get('distributed') %}
+    {%- set local_model = local_model.incorporate(path={"identifier": model['name'] + local_suffix}) -%}
+  {% endif %}
 
-  {%- set existing_relation = load_cached_relation(this) -%}
-  {%- set target_relation = this.incorporate(type='table') -%}
+  {%- set existing_relation = load_cached_relation(local_model) -%}
+  {%- set target_relation = local_model.incorporate(type='table') -%}
 
   {%- set unique_key = config.get('unique_key') -%}
   {% if unique_key is not none and unique_key|length == 0 %}
@@ -86,6 +91,10 @@
       {% do to_drop.append(backup_relation) %}
   {% endif %}
 
+  {% if config.get('distributed') %}
+    {% do clickhouse__incremental_create_distributed(target_relation) %}
+  {% endif %}
+
   {% set should_revoke = should_revoke(existing_relation, full_refresh_mode) %}
   {% do apply_grants(target_relation, grant_config, should_revoke=should_revoke) %}
 
@@ -136,7 +145,7 @@
 
 {% macro clickhouse__incremental_legacy(existing_relation, intermediate_relation, on_schema_change, unique_key) %}
     -- First create a temporary table for all of the new data
-    {% set new_data_relation = existing_relation.incorporate(path={"identifier": model['name'] + '__dbt_new_data'}) %}
+    {% set new_data_relation = existing_relation.incorporate(path={"identifier": existing_relation.name + '__dbt_new_data'}) %}
     {{ drop_relation_if_exists(new_data_relation) }}
     {% call statement('create_new_data_temp') %}
         {{ get_create_table_as_sql(False, new_data_relation, sql) }}
@@ -178,12 +187,11 @@
     {% endcall %}
 
     {% do adapter.drop_relation(new_data_relation) %}
-
 {% endmacro %}
 
 
 {% macro clickhouse__incremental_delete_insert(existing_relation, unique_key, incremental_predicates) %}
-    {% set new_data_relation = existing_relation.incorporate(path={"identifier": model['name']
+    {% set new_data_relation = existing_relation.incorporate(path={"identifier": existing_relation.name
        + '__dbt_new_data_' + invocation_id.replace('-', '_')}) %}
     {{ drop_relation_if_exists(new_data_relation) }}
     {% call statement('main') %}
@@ -202,7 +210,40 @@
     {%- set dest_columns = adapter.get_columns_in_relation(existing_relation) -%}
     {%- set dest_cols_csv = dest_columns | map(attribute='quoted') | join(', ') -%}
     {% call statement('insert_new_data') %}
-        insert into {{ existing_relation}} select {{ dest_cols_csv}} from {{ new_data_relation }}
+        insert into {{ existing_relation }} select {{ dest_cols_csv}} from {{ new_data_relation }}
     {% endcall %}
     {% do adapter.drop_relation(new_data_relation) %}
+{% endmacro %}
+
+{% macro clickhouse__incremental_create_distributed(relation) %}
+    {%- set cluster = adapter.get_clickhouse_cluster_name()[1:-1] -%}
+    {%- set sharding = config.get('sharding_key') -%}
+    {%- set existing_relation = load_cached_relation(this) -%}
+    
+    {% if existing_relation is none %}
+      {% call statement('create_distributed_table') %}
+        CREATE TABLE {{ model['name'] }} {{ on_cluster_clause() }} AS {{ relation }}
+        ENGINE = Distributed('{{ cluster}}', '{{ relation.schema }}', '{{ relation.name }}'
+        {% if sharding is not none %}
+            , {{ sharding }}
+        {% endif %}
+        )
+      {% endcall %}
+    {% else %}
+      {% call statement('create_temp_distributed_table') %}
+        CREATE TABLE {{ model['name'] }}_dbt_temp {{ on_cluster_clause() }} AS {{ relation }}
+        ENGINE = Distributed('{{ cluster}}', '{{ relation.schema }}', '{{ relation.name }}'
+        {% if sharding is not none %}
+            , {{ sharding }}
+        {% endif %}
+        )
+      {% endcall %}
+      {% call statement('exchange_distributed_table') %}
+        EXCHANGE TABLES {{ model['name'] }}_dbt_temp AND {{ model['name'] }} {{ on_cluster_clause() }}
+      {% endcall %}
+      {% call statement('drop_temp_distributed_table') %}
+        DROP TABLE {{ model['name'] }}_dbt_temp {{ on_cluster_clause() }}
+      {% endcall %}
+    {% endif %}
+
 {% endmacro %}
