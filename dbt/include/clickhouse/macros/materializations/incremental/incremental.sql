@@ -259,8 +259,8 @@
             delete from {{ existing_local }} {{ on_cluster_clause(existing_relation) }} where ({{ unique_key }}) in (select {{ unique_key }}
                                           from {{ inserting_relation }})
       {% else %}
-            delete from {{ existing_relation }} where ({{ unique_key }}) in (select {{ unique_key }}
-                                          from {{ inserting_relation }})
+          delete from {{ existing_relation }} {{ on_cluster_clause() }} where ({{ unique_key }}) in (select {{ unique_key }}
+                                              from {{ new_data_relation }})
       {% endif %}
       {%- if incremental_predicates %}
         {% for predicate in incremental_predicates %}
