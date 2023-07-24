@@ -198,13 +198,14 @@
         {{ get_create_table_as_sql(False, new_data_relation, sql) }}
     {% endcall %}
     {% call statement('delete_existing_data') %}
-      delete from {{ existing_relation }} where ({{ unique_key }}) in (select {{ unique_key }}
+      delete from {{ existing_relation }} {{ on_cluster_clause() }} where ({{ unique_key }}) in (select {{ unique_key }}
                                           from {{ new_data_relation }})
       {%- if incremental_predicates %}
         {% for predicate in incremental_predicates %}
             and {{ predicate }}
         {% endfor %}
-      {%- endif -%};
+      {%- endif %}
+      SETTINGS mutations_sync = 1, allow_nondeterministic_mutations = 1
     {% endcall %}
 
     {%- set dest_columns = adapter.get_columns_in_relation(existing_relation) -%}
