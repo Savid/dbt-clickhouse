@@ -169,10 +169,12 @@
     )
 {%- endmacro %}
 
-{% macro clickhouse__insert_into(target_relation, sql) %}
+{% macro clickhouse__insert_into(target_relation, sql, override_name) %}
   {%- set dest_columns = adapter.get_columns_in_relation(target_relation) -%}
   {%- set dest_cols_csv = dest_columns | map(attribute='quoted') | join(', ') -%}
+  {%- set target_name = override_name or target_relation.name -%}
 
-  insert into {{ target_relation }} ({{ dest_cols_csv }})
+  insert into {{ target_name }} ({{ dest_cols_csv }})
   {{ sql }}
+  SETTINGS mutations_sync = 2, insert_distributed_sync = 1
 {%- endmacro %}

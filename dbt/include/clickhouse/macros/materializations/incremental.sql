@@ -36,7 +36,14 @@
   {% if existing_relation is none %}
     -- No existing table, simply create a new one
     {% call statement('main') %}
-        {{ get_create_table_as_sql(False, target_relation, sql) }}
+        {{ create_empty_table(target_relation, sql) }}
+    {% endcall %}
+    {% if config.get('distributed') %}
+      {% do clickhouse__incremental_create_distributed(target_relation) %}
+    {% endif %}
+
+    {% call statement('main') %}
+      {{ clickhouse__insert_into(target_relation, sql, model['name']) }}
     {% endcall %}
 
   {% elif full_refresh_mode %}
@@ -44,6 +51,9 @@
     {% call statement('main') %}
         {{ get_create_table_as_sql(False, intermediate_relation, sql) }}
     {% endcall %}
+    {% if config.get('distributed') %}
+      {% do clickhouse__incremental_create_distributed(target_relation) %}
+    {% endif %}
     {% set need_swap = true %}
 
   {% elif inserts_only or unique_key is none -%}
@@ -51,10 +61,13 @@
     -- table. It is the user's responsibility to avoid duplicates.  Note that "inserts_only" is a ClickHouse adapter
     -- specific configurable that is used to avoid creating an expensive intermediate table.
     {% call statement('main') %}
-        {{ clickhouse__insert_into(target_relation, sql) }}
+        {{ clickhouse__insert_into(target_relation, sql, model['name']) }}
     {% endcall %}
 
   {% else %}
+    {% if config.get('distributed') %}
+      {% do clickhouse__incremental_create_distributed(target_relation) %}
+    {% endif %}
     {% set schema_changes = none %}
     {% set incremental_strategy = adapter.calculate_incremental_strategy(config.get('incremental_strategy'))  %}
     {% set incremental_predicates = config.get('predicates', none) or config.get('incremental_predicates', none) %}
@@ -75,7 +88,7 @@
       {% do clickhouse__incremental_delete_insert(existing_relation, unique_key, incremental_predicates) %}
     {% elif incremental_strategy == 'append' %}
       {% call statement('main') %}
-        {{ clickhouse__insert_into(target_relation, sql) }}
+        {{ clickhouse__insert_into(target_relation, sql, model['name']) }}
       {% endcall %}
     {% endif %}
   {% endif %}
@@ -89,10 +102,6 @@
         {% do adapter.rename_relation(intermediate_relation, target_relation) %}
       {% endif %}
       {% do to_drop.append(backup_relation) %}
-  {% endif %}
-
-  {% if config.get('distributed') %}
-    {% do clickhouse__incremental_create_distributed(target_relation) %}
   {% endif %}
 
   {% set should_revoke = should_revoke(existing_relation, full_refresh_mode) %}
@@ -205,15 +214,18 @@
             and {{ predicate }}
         {% endfor %}
       {%- endif %}
-      SETTINGS mutations_sync = 1, allow_nondeterministic_mutations = 1
+      SETTINGS mutations_sync = 2, allow_nondeterministic_mutations = 1
     {% endcall %}
 
     {%- set dest_columns = adapter.get_columns_in_relation(existing_relation) -%}
     {%- set dest_cols_csv = dest_columns | map(attribute='quoted') | join(', ') -%}
     {% call statement('insert_new_data') %}
-        insert into {{ existing_relation }} select {{ dest_cols_csv}} from {{ new_data_relation }}
+        insert into {{ model['name'] }} select {{ dest_cols_csv}} from {{ new_data_relation }} SETTINGS mutations_sync = 2, insert_distributed_sync = 1
     {% endcall %}
     {% do adapter.drop_relation(new_data_relation) %}
+    {% call statement('optimize_table') %}
+        optimize table {{ existing_relation }} {{ on_cluster_clause() }} FINAL DEDUPLICATE
+    {% endcall %}
 {% endmacro %}
 
 {% macro clickhouse__incremental_create_distributed(relation) %}
@@ -230,21 +242,25 @@
         {% endif %}
         )
       {% endcall %}
-    {% else %}
-      {% call statement('create_temp_distributed_table') %}
-        CREATE TABLE {{ model['name'] }}_dbt_temp {{ on_cluster_clause() }} AS {{ relation }}
-        ENGINE = Distributed('{{ cluster}}', '{{ relation.schema }}', '{{ relation.name }}'
-        {% if sharding is not none %}
-            , {{ sharding }}
-        {% endif %}
-        )
-      {% endcall %}
-      {% call statement('exchange_distributed_table') %}
-        EXCHANGE TABLES {{ model['name'] }}_dbt_temp AND {{ model['name'] }} {{ on_cluster_clause() }}
-      {% endcall %}
-      {% call statement('drop_temp_distributed_table') %}
-        DROP TABLE {{ model['name'] }}_dbt_temp {{ on_cluster_clause() }}
-      {% endcall %}
     {% endif %}
 
 {% endmacro %}
+
+
+{% macro create_empty_table(relation, sql) -%}
+  {%- set sql_header = config.get('sql_header', none) -%}
+
+  {{ sql_header if sql_header is not none }}
+
+  create table {{ relation.include(database=False) }}
+  {{ on_cluster_clause() }}
+  {{ engine_clause() }}
+  {{ order_cols(label="order by") }}
+  {{ primary_key_clause(label="primary key") }}
+  {{ partition_cols(label="partition by") }}
+  {{ adapter.get_model_settings(model) }}
+  empty
+  as (
+    {{ sql }}
+  )
+{%- endmacro %}
