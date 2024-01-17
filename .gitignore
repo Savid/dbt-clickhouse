@@ -96,4 +96,3 @@ dbt-tut
 # local development stuff
 dev/
 .python-version
-*_project/

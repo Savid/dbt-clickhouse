@@ -1,3 +1,14 @@
+{% macro clickhouse__create_view_as(relation, sql) -%}
+  {%- set sql_header = config.get('sql_header', none) -%}
+
+  {{ sql_header if sql_header is not none }}
+
+  create view {{ relation.include(database=False) }} {{ on_cluster_clause()}}
+  as (
+    {{ sql }}
+  )
+{%- endmacro %}
+
 {% macro clickhouse__list_schemas(database) %}
   {% call statement('list_schemas', fetch_result=True, auto_begin=False) %}
     select name from system.databases
@@ -8,14 +19,14 @@
 {% macro clickhouse__create_schema(relation) -%}
   {%- call statement('create_schema') -%}
     create database if not exists {{ relation.without_identifier().include(database=False) }}
-        {{ on_cluster_clause(relation)}}
+        {{ on_cluster_clause()}}
         {{ adapter.clickhouse_db_engine_clause() }}
   {% endcall %}
 {% endmacro %}
 
 {% macro clickhouse__drop_schema(relation) -%}
   {%- call statement('drop_schema') -%}
-    drop database if exists {{ relation.without_identifier().include(database=False) }} {{ on_cluster_clause(relation)}}
+    drop database if exists {{ relation.without_identifier().include(database=False) }} {{ on_cluster_clause()}}
   {%- endcall -%}
 {% endmacro %}
 
@@ -25,19 +36,9 @@
       t.name as name,
       t.database as schema,
       if(engine not in ('MaterializedView', 'View'), 'table', 'view') as type,
-      db.engine as db_engine,
-      {%- if adapter.get_clickhouse_cluster_name() -%}
-        count(distinct _shard_num) > 1  as  is_on_cluster
-        from clusterAllReplicas({{ adapter.get_clickhouse_cluster_name() }}, system.tables) as t
-          join system.databases as db on t.database = db.name
-        where schema = '{{ schema_relation.schema }}'
-        group by name, schema, type, db_engine
-      {%- else -%}
-        0 as is_on_cluster
-          from system.tables as t join system.databases as db on t.database = db.name
-        where schema = '{{ schema_relation.schema }}'
-      {% endif %}
-
+      db.engine as db_engine
+    from system.tables as t JOIN system.databases as db on t.database = db.name
+    where schema = '{{ schema_relation.schema }}'
   {% endcall %}
   {{ return(load_result('list_relations_without_caching').table) }}
 {% endmacro %}
@@ -55,23 +56,22 @@
 
 {% macro clickhouse__drop_relation(relation, obj_type='table') -%}
   {% call statement('drop_relation', auto_begin=False) -%}
-    {# drop relation on cluster by default if cluster is set #}
-    drop {{ obj_type }} if exists {{ relation }} {{ on_cluster_clause(relation.without_identifier(), True)}}
+    drop {{ obj_type }} if exists {{ relation }} {{ on_cluster_clause()}}
   {%- endcall %}
 {% endmacro %}
 
 {% macro clickhouse__rename_relation(from_relation, to_relation, obj_type='table') -%}
   {% call statement('drop_relation') %}
-    drop {{ obj_type }} if exists {{ to_relation }} {{ on_cluster_clause(to_relation.without_identifier())}}
+    drop {{ obj_type }} if exists {{ to_relation }} {{ on_cluster_clause()}}
   {% endcall %}
   {% call statement('rename_relation') %}
-    rename {{ obj_type }} {{ from_relation }} to {{ to_relation }} {{ on_cluster_clause(from_relation)}}
+    rename {{ obj_type }} {{ from_relation }} to {{ to_relation }} {{ on_cluster_clause()}}
   {% endcall %}
 {% endmacro %}
 
 {% macro clickhouse__truncate_relation(relation) -%}
   {% call statement('truncate_relation') -%}
-    truncate table {{ relation }} {{ on_cluster_clause(relation)}}
+    truncate table {{ relation }} {{ on_cluster_clause()}}
   {%- endcall %}
 {% endmacro %}
 
@@ -84,7 +84,7 @@
 
 
 {% macro clickhouse__generate_database_name(custom_database_name=none, node=none) -%}
-  {% do return('') %}
+  {% do return(None) %}
 {%- endmacro %}
 
 {% macro clickhouse__get_columns_in_query(select_sql) %}
@@ -100,18 +100,17 @@
 
 {% macro clickhouse__alter_column_type(relation, column_name, new_column_type) -%}
   {% call statement('alter_column_type') %}
-    alter table {{ relation }} {{ on_cluster_clause(relation)}} modify column {{ adapter.quote(column_name) }} {{ new_column_type }}
+    alter table {{ relation }} {{ on_cluster_clause()}} modify column {{ adapter.quote(column_name) }} {{ new_column_type }}
   {% endcall %}
 {% endmacro %}
 
 {% macro exchange_tables_atomic(old_relation, target_relation, obj_types='TABLES') %}
 
-  {%- if adapter.get_clickhouse_cluster_name() is not none and obj_types == 'TABLES' and 'Replicated' in engine_clause() %}
-    {%- call statement('exchange_table_sync_replica') -%}
-      SYSTEM SYNC REPLICA  {{ on_cluster_clause(target_relation) }} {{ target_relation.schema }}.{{ target_relation.identifier }}
-    {% endcall %}
+  {%- if adapter.get_clickhouse_cluster_name() is not none and obj_types == 'TABLES' %}
+    {% do run_query("SYSTEM SYNC REPLICA " + on_cluster_clause() + target_relation.schema + '.' + target_relation.identifier) %}
   {%- endif %}
+  
   {%- call statement('exchange_tables_atomic') -%}
-    EXCHANGE {{ obj_types }} {{ old_relation }} AND {{ target_relation }} {{ on_cluster_clause(target_relation)}}
+    EXCHANGE {{ obj_types }} {{ old_relation }} AND {{ target_relation }} {{ on_cluster_clause()}}
   {% endcall %}
 {% endmacro %}

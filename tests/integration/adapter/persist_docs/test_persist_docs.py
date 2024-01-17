@@ -101,16 +101,14 @@ class BasePersistDocs(BasePersistDocsBase):
             }
         }
 
-    def test_has_comments_pg_like(self):
-        if os.environ.get('DBT_CH_TEST_CLOUD', '').lower() in ('1', 'true', 'yes'):
-            pytest.skip('Not running comment test for cloud')
+    def test_has_comments_pglike(self, project):
         run_dbt(["docs", "generate"])
         with open("target/catalog.json") as fp:
             catalog_data = json.load(fp)
         assert "nodes" in catalog_data
         assert len(catalog_data["nodes"]) == 4
         table_node = catalog_data["nodes"]["model.test.table_model"]
-        self._assert_has_table_comments(table_node)
+        view_node = self._assert_has_table_comments(table_node)
 
         view_node = catalog_data["nodes"]["model.test.view_model"]
         self._assert_has_view_comments(view_node)
