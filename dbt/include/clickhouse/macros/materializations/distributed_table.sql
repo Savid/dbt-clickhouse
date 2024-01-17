@@ -1,21 +1,11 @@
 {% materialization distributed_table, adapter='clickhouse' %}
-  {% set insert_distributed_sync = run_query("SELECT value FROM system.settings WHERE name = 'insert_distributed_sync'")[0][0] %}
-  {% if insert_distributed_sync != '1' %}
-     {% do exceptions.raise_compiler_error('To use distributed materialization setting insert_distributed_sync should be set to 1') %}
-  {% endif %}
-
   {%- set local_suffix = adapter.get_clickhouse_local_suffix() -%}
 
   {%- set existing_relation = load_cached_relation(this) -%}
   {%- set target_relation = this.incorporate(type='table') -%}
 
-  {% set on_cluster = on_cluster_clause(target_relation) %}
-  {% if on_cluster.strip() == '' %}
-     {% do exceptions.raise_compiler_error('To use distributed materialization cluster setting in dbt profile must be set') %}
-  {% endif %}
-
-  {% set existing_relation_local = existing_relation.incorporate(path={"identifier": this.identifier + local_suffix}) if existing_relation is not none else none %}
-  {% set target_relation_local = target_relation.incorporate(path={"identifier": this.identifier + local_suffix}) if target_relation is not none else none %}
+  {% set existing_relation_local = existing_relation.incorporate(path={"identifier": model['name'] + local_suffix}) if existing_relation is not none else none %}
+  {% set target_relation_local = target_relation.incorporate(path={"identifier": model['name'] + local_suffix}) if target_relation is not none else none %}
 
   {%- set backup_relation = none -%}
   {%- set preexisting_backup_relation = none -%}
@@ -47,24 +37,23 @@
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
   {% if backup_relation is none %}
-    {{ create_distributed_local_table(target_relation, target_relation_local, view_relation) }}
+    {% do run_query(create_empty_table_from_relation(target_relation_local, view_relation)) or '' %}
+    {% do run_query(create_distributed_table(target_relation, target_relation_local)) or '' %}
   {% elif existing_relation.can_exchange %}
     -- We can do an atomic exchange, so no need for an intermediate
     {% call statement('main') -%}
-      {{ create_empty_table_from_relation(backup_relation, view_relation) }}
+      {% do run_query(create_empty_table_from_relation(backup_relation, view_relation)) or '' %}
     {%- endcall %}
-    {% do exchange_tables_atomic(backup_relation, existing_relation_local) %}
+    {% do exchange_tables_atomic(backup_relation, existing_relation) %}
   {% else %}
     {% do run_query(create_empty_table_from_relation(intermediate_relation, view_relation)) or '' %}
     {{ adapter.rename_relation(existing_relation_local, backup_relation) }}
     {{ adapter.rename_relation(intermediate_relation, target_relation_local) }}
-    {{ create_distributed_table(target_relation, target_relation_local) }}
   {% endif %}
   {% do run_query(clickhouse__insert_into(target_relation, sql)) or '' %}
   {{ drop_relation_if_exists(view_relation) }}
   -- cleanup
   {% set should_revoke = should_revoke(existing_relation, full_refresh_mode=True) %}
-  {% do apply_grants(target_relation_local, grant_config, should_revoke=should_revoke) %}
   {% do apply_grants(target_relation, grant_config, should_revoke=should_revoke) %}
 
   {% do persist_docs(target_relation, model) %}
@@ -77,21 +66,14 @@
 {% endmaterialization %}
 
 {% macro create_distributed_table(relation, local_relation) %}
-    {%- set cluster = adapter.get_clickhouse_cluster_name() -%}
-   {% if cluster is none %}
-        {% do exceptions.raise_compiler_error('Cluster name should be defined for using distributed materializations, current is None') %}
-    {% endif %}
-
-   {%- set cluster = cluster[1:-1] -%}
+   {%- set cluster = adapter.get_clickhouse_cluster_name()[1:-1] -%}
    {%- set sharding = config.get('sharding_key') -%}
 
-    create table {{ relation }} {{ on_cluster_clause(relation) }} as {{ local_relation }}
+    CREATE TABLE {{ relation }} {{ on_cluster_clause() }} AS {{ local_relation }}
     ENGINE = Distributed('{{ cluster}}', '{{ relation.schema }}', '{{ local_relation.name }}'
-    {%- if sharding is not none and sharding.strip() != '' -%}
+    {% if sharding is not none %}
         , {{ sharding }}
-    {%- else %}
-        , rand()
-    {% endif -%}
+    {% endif %}
     )
  {% endmacro %}
 
@@ -106,7 +88,7 @@
   {{ sql_header if sql_header is not none }}
 
   create table {{ relation.include(database=False) }}
-  {{ on_cluster_clause(relation) }} (
+  {{ on_cluster_clause() }} (
       {{col_list | join(', ')}}
   )
 
@@ -115,14 +97,4 @@
   {{ primary_key_clause(label="primary key") }}
   {{ partition_cols(label="partition by") }}
   {{ adapter.get_model_settings(model) }}
-{%- endmacro %}
-
-{% macro create_distributed_local_table(distributed_relation, shard_relation, structure_relation, sql_query=none) -%}
-  {{ drop_relation_if_exists(shard_relation) }}
-  {{ drop_relation_if_exists(distributed_relation) }}
-  {% do run_query(create_empty_table_from_relation(shard_relation, structure_relation)) or '' %}
-  {% do run_query(create_distributed_table(distributed_relation, shard_relation)) or '' %}
-  {% if sql_query is not none %}
-    {% do run_query(clickhouse__insert_into(distributed_relation, sql_query)) or '' %}
-  {% endif %}
 {%- endmacro %}

@@ -16,7 +16,7 @@ class ClickHouseCredentials(Credentials):
     port: Optional[int] = None
     user: Optional[str] = 'default'
     retries: int = 1
-    database: Optional[str] = ''
+    database: Optional[str] = None
     schema: Optional[str] = 'default'
     password: str = ''
     cluster: Optional[str] = None
@@ -33,7 +33,6 @@ class ClickHouseCredentials(Credentials):
     custom_settings: Optional[Dict[str, Any]] = None
     use_lw_deletes: bool = False
     local_suffix: str = 'local'
-    allow_automatic_deduplication: bool = False
 
     @property
     def type(self):
@@ -44,7 +43,7 @@ class ClickHouseCredentials(Credentials):
         return self.host
 
     def __post_init__(self):
-        if self.database and self.database != self.schema:
+        if self.database is not None and self.database != self.schema:
             raise DbtRuntimeError(
                 f'    schema: {self.schema} \n'
                 f'    database: {self.database} \n'
@@ -52,7 +51,7 @@ class ClickHouseCredentials(Credentials):
                 f'On Clickhouse, database must be omitted or have the same value as'
                 f' schema.'
             )
-        self.database = ''
+        self.database = None
 
     def _connection_keys(self):
         return (
@@ -74,5 +73,4 @@ class ClickHouseCredentials(Credentials):
             'check_exchange',
             'custom_settings',
             'use_lw_deletes',
-            'allow_automatic_deduplication',
         )
